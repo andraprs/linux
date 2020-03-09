@@ -703,6 +703,45 @@ free_mem_region:
 	return rc;
 }
 
+/**
+ * ne_start_enclave_ioctl - Trigger enclave start after the enclave resources,
+ * such as memory and CPU, have been set.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ * @enclave_start_info: enclave info that includes enclave cid and flags.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_start_enclave_ioctl(struct ne_enclave *ne_enclave,
+	struct ne_enclave_start_info *enclave_start_info)
+{
+	struct ne_pci_dev_cmd_reply cmd_reply = {};
+	struct enclave_start_req enclave_start_req = {};
+	int rc = -EINVAL;
+
+	enclave_start_req.enclave_cid = enclave_start_info->enclave_cid;
+	enclave_start_req.flags = enclave_start_info->flags;
+	enclave_start_req.slot_uid = ne_enclave->slot_uid;
+
+	rc = ne_do_request(ne_enclave->pdev, ENCLAVE_START, &enclave_start_req,
+			   sizeof(enclave_start_req), &cmd_reply,
+			   sizeof(cmd_reply));
+	if (rc < 0) {
+		dev_err_ratelimited(ne_misc_dev.this_device,
+				    "Error in enclave start [rc=%d]\n", rc);
+
+		return rc;
+	}
+
+	ne_enclave->state = NE_STATE_RUNNING;
+
+	enclave_start_info->enclave_cid = cmd_reply.enclave_cid;
+
+	return 0;
+}
+
 static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -814,6 +853,81 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 		rc = ne_set_user_memory_region_ioctl(ne_enclave, &mem_region);
 
 		mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+		return rc;
+	}
+
+	case NE_START_ENCLAVE: {
+		struct ne_enclave_start_info enclave_start_info = {};
+		int rc = -EINVAL;
+
+		if (copy_from_user(&enclave_start_info, (void *)arg,
+				   sizeof(enclave_start_info))) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Error in copy from user\n");
+
+			return -EFAULT;
+		}
+
+		mutex_lock(&ne_enclave->enclave_info_mutex);
+
+		if (ne_enclave->state != NE_STATE_INIT) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Enclave isn't in init state\n");
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -EINVAL;
+		}
+
+		if (!ne_enclave->nr_mem_regions) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Enclave has no mem regions\n");
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -ENOMEM;
+		}
+
+		if (ne_enclave->mem_size < NE_MIN_ENCLAVE_MEM_SIZE) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Enclave memory is less than %ld\n",
+					    NE_MIN_ENCLAVE_MEM_SIZE);
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -ENOMEM;
+		}
+
+		if (!ne_enclave->nr_vcpus) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Enclave has no vcpus\n");
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -EINVAL;
+		}
+
+		if (!cpumask_empty(ne_enclave->cpu_siblings)) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "CPU siblings not used\n");
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -EINVAL;
+		}
+
+		rc = ne_start_enclave_ioctl(ne_enclave, &enclave_start_info);
+
+		mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+		if (copy_to_user((void *)arg, &enclave_start_info,
+				 sizeof(enclave_start_info))) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Error in copy to user\n");
+
+			return -EFAULT;
+		}
 
 		return rc;
 	}

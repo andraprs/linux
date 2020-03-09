@@ -593,6 +593,15 @@ static int ne_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_ne_pci_dev_enable;
 	}
 
+	rc = misc_register(&ne_miscdevice);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in misc dev register [rc=%d]\n",
+				    rc);
+
+		goto err_misc_register;
+	}
+
 	atomic_set(&ne_pci_dev->cmd_reply_avail, 0);
 	init_waitqueue_head(&ne_pci_dev->cmd_reply_wait_q);
 	INIT_LIST_HEAD(&ne_pci_dev->enclaves_list);
@@ -603,6 +612,8 @@ static int ne_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	return 0;
 
+err_misc_register:
+	ne_pci_dev_disable(pdev, ne_pci_dev);
 err_ne_pci_dev_enable:
 err_ne_pci_dev_disable:
 	free_irq(pci_irq_vector(pdev, NE_VEC_EVENT), ne_pci_dev);
@@ -626,6 +637,8 @@ static void ne_remove(struct pci_dev *pdev)
 
 	if (!ne_pci_dev || !ne_pci_dev->iomem_base)
 		return;
+
+	misc_deregister(&ne_miscdevice);
 
 	ne_pci_dev_disable(pdev, ne_pci_dev);
 

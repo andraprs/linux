@@ -455,6 +455,53 @@ err_get_user_pages:
 	return rc;
 }
 
+/**
+ * ne_enclave_start_ioctl - Trigger enclave start after the enclave resources,
+ * such as memory and CPU, have been set.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ * @enclave_start_metadata: enclave metadata that includes enclave cid and
+ *			    flags and the slot uid.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_enclave_start_ioctl(struct ne_enclave *ne_enclave,
+	struct enclave_start_metadata *enclave_start_metadata)
+{
+	struct ne_pci_dev_cmd_reply cmd_reply = {};
+	struct enclave_start_req enclave_start_req = {};
+	int rc = -EINVAL;
+
+	BUG_ON(!ne_enclave);
+	BUG_ON(!ne_enclave->pdev);
+
+	if (WARN_ON(!enclave_start_metadata))
+		return -EINVAL;
+
+	enclave_start_metadata->slot_uid = ne_enclave->slot_uid;
+
+	enclave_start_req.enclave_cid = enclave_start_metadata->enclave_cid;
+	enclave_start_req.flags = enclave_start_metadata->flags;
+	enclave_start_req.slot_uid = enclave_start_metadata->slot_uid;
+
+	rc = ne_do_request(ne_enclave->pdev, ENCLAVE_START, &enclave_start_req,
+			   sizeof(enclave_start_req), &cmd_reply,
+			   sizeof(cmd_reply));
+	if (rc < 0) {
+		pr_err_ratelimited("Failure in enclave start [rc=%d]\n", rc);
+
+		return rc;
+	}
+
+	ne_enclave->state = NE_STATE_RUNNING;
+
+	enclave_start_metadata->enclave_cid = cmd_reply.enclave_cid;
+
+	return 0;
+}
+
 static int ne_enclave_open(struct inode *node, struct file *file)
 {
 	return 0;
@@ -517,6 +564,42 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 		rc = ne_set_user_memory_region_ioctl(ne_enclave, &mem_region);
 
 		mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+		return rc;
+	}
+
+	case NE_ENCLAVE_START: {
+		struct enclave_start_metadata enclave_start_metadata = {};
+		int rc = -EINVAL;
+
+		if (copy_from_user(&enclave_start_metadata, (void *)arg,
+				   sizeof(enclave_start_metadata))) {
+			pr_err_ratelimited("Failure in copy from user\n");
+
+			return -EFAULT;
+		}
+
+		mutex_lock(&ne_enclave->enclave_info_mutex);
+
+		if (!cpumask_empty(ne_enclave->cpu_siblings)) {
+			pr_err_ratelimited("Enclave has CPU siblings avail\n");
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+			return -EINVAL;
+		}
+
+		rc = ne_enclave_start_ioctl(ne_enclave,
+					    &enclave_start_metadata);
+
+		mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+		if (copy_to_user((void *)arg, &enclave_start_metadata,
+				 sizeof(enclave_start_metadata))) {
+			pr_err_ratelimited("Failure in copy to user\n");
+
+			return -EFAULT;
+		}
 
 		return rc;
 	}

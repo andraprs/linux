@@ -41,6 +41,251 @@ static const struct pci_device_id ne_pci_ids[] = {
 MODULE_DEVICE_TABLE(pci, ne_pci_ids);
 
 /**
+ * ne_submit_request - Submit command request to the PCI device based on the
+ * command type.
+ *
+ * This function gets called with the ne_pci_dev mutex held.
+ *
+ * @pdev: PCI device to send the command to.
+ * @cmd_type: command type of the request sent to the PCI device.
+ * @cmd_request: command request payload.
+ * @cmd_request_size: size of the command request payload.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_submit_request(struct pci_dev *pdev,
+			     enum ne_pci_dev_cmd_type cmd_type,
+			     void *cmd_request, size_t cmd_request_size)
+{
+	struct ne_pci_dev *ne_pci_dev = NULL;
+
+	BUG_ON(!pdev);
+
+	ne_pci_dev = pci_get_drvdata(pdev);
+	BUG_ON(!ne_pci_dev);
+	BUG_ON(!ne_pci_dev->iomem_base);
+
+	if (WARN_ON(cmd_type <= INVALID_CMD || cmd_type >= MAX_CMD)) {
+		dev_err_ratelimited(&pdev->dev, "Invalid cmd type=%d\n",
+				    cmd_type);
+
+		return -EINVAL;
+	}
+
+	if (WARN_ON(!cmd_request))
+		return -EINVAL;
+
+	if (WARN_ON(cmd_request_size > NE_SEND_DATA_SIZE)) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Invalid req size=%ld for cmd type=%d\n",
+				    cmd_request_size, cmd_type);
+
+		return -EINVAL;
+	}
+
+	memcpy_toio(ne_pci_dev->iomem_base + NE_SEND_DATA, cmd_request,
+		    cmd_request_size);
+
+	iowrite32(cmd_type, ne_pci_dev->iomem_base + NE_COMMAND);
+
+	return 0;
+}
+
+/**
+ * ne_retrieve_reply - Retrieve reply from the PCI device.
+ *
+ * This function gets called with the ne_pci_dev mutex held.
+ *
+ * @pdev: PCI device to receive the reply from.
+ * @cmd_reply: command reply payload.
+ * @cmd_reply_size: size of the command reply payload.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_retrieve_reply(struct pci_dev *pdev,
+			     struct ne_pci_dev_cmd_reply *cmd_reply,
+			     size_t cmd_reply_size)
+{
+	struct ne_pci_dev *ne_pci_dev = NULL;
+
+	BUG_ON(!pdev);
+
+	ne_pci_dev = pci_get_drvdata(pdev);
+	BUG_ON(!ne_pci_dev);
+	BUG_ON(!ne_pci_dev->iomem_base);
+
+	if (WARN_ON(!cmd_reply))
+		return -EINVAL;
+
+	if (WARN_ON(cmd_reply_size > NE_RECV_DATA_SIZE)) {
+		dev_err_ratelimited(&pdev->dev, "Invalid reply size=%ld\n",
+				    cmd_reply_size);
+
+		return -EINVAL;
+	}
+
+	memcpy_fromio(cmd_reply, ne_pci_dev->iomem_base + NE_RECV_DATA,
+		      cmd_reply_size);
+
+	return 0;
+}
+
+/**
+ * ne_wait_for_reply - Wait for a reply of a PCI command.
+ *
+ * This function gets called with the ne_pci_dev mutex held.
+ *
+ * @pdev: PCI device for which a reply is waited.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_wait_for_reply(struct pci_dev *pdev)
+{
+	struct ne_pci_dev *ne_pci_dev = NULL;
+	int rc = -EINVAL;
+
+	BUG_ON(!pdev);
+
+	ne_pci_dev = pci_get_drvdata(pdev);
+	BUG_ON(!ne_pci_dev);
+
+	/*
+	 * TODO: Update to _interruptible and handle interrupted wait event
+	 * e.g. -ERESTARTSYS, incoming signals + add / update timeout.
+	 */
+	rc = wait_event_timeout(ne_pci_dev->cmd_reply_wait_q,
+				atomic_read(&ne_pci_dev->cmd_reply_avail) != 0,
+				msecs_to_jiffies(DEFAULT_TIMEOUT_MSECS));
+	if (!rc) {
+		pr_err("Wait event timed out when waiting for PCI cmd reply\n");
+
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+int ne_do_request(struct pci_dev *pdev, enum ne_pci_dev_cmd_type cmd_type,
+		  void *cmd_request, size_t cmd_request_size,
+		  struct ne_pci_dev_cmd_reply *cmd_reply, size_t cmd_reply_size)
+{
+	struct ne_pci_dev *ne_pci_dev = NULL;
+	int rc = -EINVAL;
+
+	BUG_ON(!pdev);
+
+	ne_pci_dev = pci_get_drvdata(pdev);
+	BUG_ON(!ne_pci_dev);
+	BUG_ON(!ne_pci_dev->iomem_base);
+
+	if (WARN_ON(cmd_type <= INVALID_CMD || cmd_type >= MAX_CMD)) {
+		dev_err_ratelimited(&pdev->dev, "Invalid cmd type=%d\n",
+				    cmd_type);
+
+		return -EINVAL;
+	}
+
+	if (WARN_ON(!cmd_request))
+		return -EINVAL;
+
+	if (WARN_ON(cmd_request_size > NE_SEND_DATA_SIZE)) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Invalid req size=%ld for cmd type=%d\n",
+				    cmd_request_size, cmd_type);
+
+		return -EINVAL;
+	}
+
+	if (WARN_ON(!cmd_reply))
+		return -EINVAL;
+
+	if (WARN_ON(cmd_reply_size > NE_RECV_DATA_SIZE)) {
+		dev_err_ratelimited(&pdev->dev, "Invalid reply size=%ld\n",
+				    cmd_reply_size);
+
+		return -EINVAL;
+	}
+
+	/*
+	 * Use this mutex so that the PCI device handles one command request at
+	 * a time.
+	 */
+	mutex_lock(&ne_pci_dev->pci_dev_mutex);
+
+	atomic_set(&ne_pci_dev->cmd_reply_avail, 0);
+
+	rc = ne_submit_request(pdev, cmd_type, cmd_request, cmd_request_size);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in submit cmd request [rc=%d]\n",
+				    rc);
+
+		mutex_unlock(&ne_pci_dev->pci_dev_mutex);
+
+		return rc;
+	}
+
+	rc = ne_wait_for_reply(pdev);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in wait cmd reply [rc=%d]\n",
+				    rc);
+
+		mutex_unlock(&ne_pci_dev->pci_dev_mutex);
+
+		return rc;
+	}
+
+	rc = ne_retrieve_reply(pdev, cmd_reply, cmd_reply_size);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in retrieve cmd reply [rc=%d]\n",
+				    rc);
+
+		mutex_unlock(&ne_pci_dev->pci_dev_mutex);
+
+		return rc;
+	}
+
+	atomic_set(&ne_pci_dev->cmd_reply_avail, 0);
+
+	if (cmd_reply->rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in cmd process logic [rc=%d]\n",
+				    cmd_reply->rc);
+
+		mutex_unlock(&ne_pci_dev->pci_dev_mutex);
+
+		return cmd_reply->rc;
+	}
+
+	mutex_unlock(&ne_pci_dev->pci_dev_mutex);
+
+	return 0;
+}
+
+/**
+ * ne_reply_handler - Interrupt handler for retrieving a reply matching
+ * a request sent to the PCI device for enclave lifetime management.
+ *
+ * @irq: received interrupt for a reply sent by the PCI device.
+ * @args: PCI device private data structure.
+ *
+ * @returns: IRQ_HANDLED on handled interrupt, IRQ_NONE otherwise.
+ */
+static irqreturn_t ne_reply_handler(int irq, void *args)
+{
+	struct ne_pci_dev *ne_pci_dev = (struct ne_pci_dev *)args;
+
+	atomic_set(&ne_pci_dev->cmd_reply_avail, 1);
+
+	/* TODO: Update to _interruptible. */
+	wake_up(&ne_pci_dev->cmd_reply_wait_q);
+
+	return IRQ_HANDLED;
+}
+
+/**
  * ne_setup_msix - Setup MSI-X vectors for the PCI device.
  *
  * @pdev: PCI device to setup the MSI-X for.
@@ -75,8 +320,25 @@ static int ne_setup_msix(struct pci_dev *pdev, struct ne_pci_dev *ne_pci_dev)
 		goto err_alloc_irq_vecs;
 	}
 
+	/*
+	 * This IRQ gets triggered every time the PCI device responds to a
+	 * command request. The reply is then retrieved, reading from the MMIO
+	 * space of the PCI device.
+	 */
+	rc = request_irq(pci_irq_vector(pdev, NE_VEC_REPLY),
+			 ne_reply_handler, 0, "enclave_cmd", ne_pci_dev);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in allocating irq reply [rc=%d]\n",
+				    rc);
+
+		goto err_req_irq_reply;
+	}
+
 	return 0;
 
+err_req_irq_reply:
+	pci_free_irq_vectors(pdev);
 err_alloc_irq_vecs:
 	return rc;
 }
@@ -232,6 +494,7 @@ static int ne_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_ne_pci_dev_enable:
 err_ne_pci_dev_disable:
+	free_irq(pci_irq_vector(pdev, NE_VEC_REPLY), ne_pci_dev);
 	pci_free_irq_vectors(pdev);
 err_setup_msix:
 	pci_iounmap(pdev, ne_pci_dev->iomem_base);
@@ -255,6 +518,7 @@ static void ne_remove(struct pci_dev *pdev)
 
 	pci_set_drvdata(pdev, NULL);
 
+	free_irq(pci_irq_vector(pdev, NE_VEC_REPLY), ne_pci_dev);
 	pci_free_irq_vectors(pdev);
 
 	pci_iounmap(pdev, ne_pci_dev->iomem_base);

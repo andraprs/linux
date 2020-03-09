@@ -611,8 +611,172 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 	return 0;
 }
 
+/**
+ * ne_enclave_remove_all_mem_region_entries - Remove all memory region
+ * entries from the enclave data structure.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ */
+static void ne_enclave_remove_all_mem_region_entries(
+	struct ne_enclave *ne_enclave)
+{
+	struct ne_mem_region *ne_mem_region = NULL;
+	struct ne_mem_region *ne_mem_region_tmp = NULL;
+
+	BUG_ON(!ne_enclave);
+
+	list_for_each_entry_safe(ne_mem_region, ne_mem_region_tmp,
+				 &ne_enclave->mem_regions_list,
+				 mem_region_list_entry) {
+		list_del(&ne_mem_region->mem_region_list_entry);
+
+		unpin_user_pages(ne_mem_region->pages,
+				 ne_mem_region->nr_pages);
+
+		kzfree(ne_mem_region->pages);
+
+		kzfree(ne_mem_region);
+	}
+}
+
+/**
+ * ne_enclave_remove_all_vcpu_id_entries - Remove all vCPU id entries
+ * from the enclave data structure.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ */
+static void ne_enclave_remove_all_vcpu_id_entries(struct ne_enclave *ne_enclave)
+{
+	unsigned int cpu = 0;
+	struct ne_vcpu_id *ne_vcpu_id = NULL;
+	struct ne_vcpu_id *ne_vcpu_id_tmp = NULL;
+
+	BUG_ON(!ne_enclave);
+
+	mutex_lock(&ne_cpu_pool_mutex);
+
+	list_for_each_entry_safe(ne_vcpu_id, ne_vcpu_id_tmp,
+				 &ne_enclave->vcpu_ids_list,
+				 vcpu_id_list_entry) {
+		list_del(&ne_vcpu_id->vcpu_id_list_entry);
+
+		/* Update the available CPU pool. */
+		cpumask_set_cpu(ne_vcpu_id->vcpu_id, ne_cpu_pool.avail);
+
+		kzfree(ne_vcpu_id);
+	}
+
+	/* If any siblings left in the enclave CPU pool, move to available. */
+	for_each_cpu(cpu, ne_enclave->cpu_siblings) {
+		cpumask_clear_cpu(cpu, ne_enclave->cpu_siblings);
+
+		cpumask_set_cpu(cpu, ne_cpu_pool.avail);
+	}
+
+	free_cpumask_var(ne_enclave->cpu_siblings);
+
+	mutex_unlock(&ne_cpu_pool_mutex);
+}
+
+/**
+ * ne_pci_dev_remove_enclave_entry - Remove enclave entry from the data
+ * structure that is part of the PCI device private data.
+ *
+ * This function gets called with the ne_pci_dev enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ * @ne_pci_dev: private data associated with the PCI device.
+ */
+static void ne_pci_dev_remove_enclave_entry(struct ne_enclave *ne_enclave,
+					    struct ne_pci_dev *ne_pci_dev)
+{
+	struct ne_enclave *ne_enclave_entry = NULL;
+	struct ne_enclave *ne_enclave_entry_tmp = NULL;
+
+	BUG_ON(!ne_enclave);
+	BUG_ON(!ne_pci_dev);
+
+	list_for_each_entry_safe(ne_enclave_entry, ne_enclave_entry_tmp,
+				 &ne_pci_dev->enclaves_list,
+				 enclave_list_entry) {
+		if (ne_enclave_entry->slot_uid == ne_enclave->slot_uid) {
+			list_del(&ne_enclave_entry->enclave_list_entry);
+
+			break;
+		}
+	}
+}
+
 static int ne_enclave_release(struct inode *inode, struct file *file)
 {
+	struct ne_pci_dev_cmd_reply cmd_reply = {};
+	struct enclave_stop_req enclave_stop_request = {};
+	struct ne_enclave *ne_enclave = file->private_data;
+	struct ne_pci_dev *ne_pci_dev = NULL;
+	int rc = -EINVAL;
+	struct slot_free_req slot_free_req = {};
+
+	BUG_ON(!ne_enclave);
+	BUG_ON(!ne_enclave->pdev);
+
+	ne_pci_dev = pci_get_drvdata(ne_enclave->pdev);
+	BUG_ON(!ne_pci_dev);
+
+	/*
+	 * Acquire the enclave list mutex before the enclave mutex
+	 * in order to avoid deadlocks with @ref ne_event_work_handler.
+	 */
+	mutex_lock(&ne_pci_dev->enclaves_list_mutex);
+	mutex_lock(&ne_enclave->enclave_info_mutex);
+
+	if (ne_enclave->state != NE_STATE_INIT &&
+	    ne_enclave->state != NE_STATE_STOPPED) {
+		enclave_stop_request.slot_uid = ne_enclave->slot_uid;
+
+		rc = ne_do_request(ne_enclave->pdev, ENCLAVE_STOP,
+				   &enclave_stop_request,
+				   sizeof(enclave_stop_request), &cmd_reply,
+				   sizeof(cmd_reply));
+		if (WARN_ON(rc < 0)) {
+			pr_err_ratelimited("Failure in enclave stop [rc=%d]\n",
+					   rc);
+
+			mutex_unlock(&ne_enclave->enclave_info_mutex);
+			mutex_unlock(&ne_pci_dev->enclaves_list_mutex);
+
+			return rc;
+		}
+
+		memset(&cmd_reply, 0, sizeof(cmd_reply));
+	}
+
+	slot_free_req.slot_uid = ne_enclave->slot_uid;
+
+	rc = ne_do_request(ne_enclave->pdev, SLOT_FREE, &slot_free_req,
+			   sizeof(slot_free_req), &cmd_reply,
+			   sizeof(cmd_reply));
+	if (WARN_ON(rc < 0)) {
+		pr_err_ratelimited("Failure in slot free [rc=%d]\n", rc);
+
+		mutex_unlock(&ne_enclave->enclave_info_mutex);
+		mutex_unlock(&ne_pci_dev->enclaves_list_mutex);
+
+		return rc;
+	}
+
+	ne_pci_dev_remove_enclave_entry(ne_enclave, ne_pci_dev);
+	ne_enclave_remove_all_mem_region_entries(ne_enclave);
+	ne_enclave_remove_all_vcpu_id_entries(ne_enclave);
+
+	mutex_unlock(&ne_enclave->enclave_info_mutex);
+	mutex_unlock(&ne_pci_dev->enclaves_list_mutex);
+
+	kzfree(ne_enclave);
+
 	return 0;
 }
 

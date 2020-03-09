@@ -286,6 +286,85 @@ static irqreturn_t ne_reply_handler(int irq, void *args)
 }
 
 /**
+ * ne_event_work_handler - Work queue handler for notifying enclaves on
+ * a state change received by the event interrupt handler.
+ *
+ * An out-of-band event is being issued by the Nitro Hypervisor when at least
+ * one enclave is changing state without client interaction.
+ *
+ * @work: item containing the Nitro Enclaves PCI device for which a
+ *	  out-of-band event was issued.
+ */
+static void ne_event_work_handler(struct work_struct *work)
+{
+	struct ne_pci_dev_cmd_reply cmd_reply = {};
+	struct ne_enclave *ne_enclave = NULL;
+	struct ne_pci_dev *ne_pci_dev =
+		container_of(work, struct ne_pci_dev, notify_work);
+	int rc = -EINVAL;
+	struct slot_info_req slot_info_req = {};
+
+	mutex_lock(&ne_pci_dev->enclaves_list_mutex);
+
+	/*
+	 * Iterate over all enclaves registered for the Nitro Enclaves
+	 * PCI device and determine for which enclave(s) the out-of-band event
+	 * is corresponding to.
+	 */
+	list_for_each_entry(ne_enclave, &ne_pci_dev->enclaves_list,
+			    enclave_list_entry) {
+		mutex_lock(&ne_enclave->enclave_info_mutex);
+
+		/*
+		 * Enclaves that were never started cannot receive out-of-band
+		 * events.
+		 */
+		if (ne_enclave->state != NE_STATE_RUNNING)
+			goto unlock;
+
+		slot_info_req.slot_uid = ne_enclave->slot_uid;
+
+		rc = ne_do_request(ne_enclave->pdev, SLOT_INFO, &slot_info_req,
+				   sizeof(slot_info_req), &cmd_reply,
+				   sizeof(cmd_reply));
+		WARN_ON(rc < 0);
+
+		/* Notify enclave process that the enclave state changed. */
+		if (ne_enclave->state != cmd_reply.state) {
+			ne_enclave->state = cmd_reply.state;
+
+			ne_enclave->has_event = true;
+
+			wake_up_interruptible(&ne_enclave->eventq);
+		}
+
+unlock:
+		 mutex_unlock(&ne_enclave->enclave_info_mutex);
+	}
+
+	mutex_unlock(&ne_pci_dev->enclaves_list_mutex);
+}
+
+/**
+ * ne_event_handler - Interrupt handler for PCI device out-of-band
+ * events. This interrupt does not supply any data in the MMIO region.
+ * It notifies a change in the state of any of the launched enclaves.
+ *
+ * @irq: received interrupt for an out-of-band event.
+ * @args: PCI device private data structure.
+ *
+ * @returns: IRQ_HANDLED on handled interrupt, IRQ_NONE otherwise.
+ */
+static irqreturn_t ne_event_handler(int irq, void *args)
+{
+	struct ne_pci_dev *ne_pci_dev = (struct ne_pci_dev *)args;
+
+	queue_work(ne_pci_dev->event_wq, &ne_pci_dev->notify_work);
+
+	return IRQ_HANDLED;
+}
+
+/**
  * ne_setup_msix - Setup MSI-X vectors for the PCI device.
  *
  * @pdev: PCI device to setup the MSI-X for.
@@ -311,6 +390,19 @@ static int ne_setup_msix(struct pci_dev *pdev, struct ne_pci_dev *ne_pci_dev)
 		return rc;
 	}
 
+	ne_pci_dev->event_wq = create_singlethread_workqueue("ne_pci_dev_wq");
+	if (!ne_pci_dev->event_wq) {
+		rc = -ENOMEM;
+
+		dev_err_ratelimited(&pdev->dev,
+				    "Cannot get wq for device events [rc=%d]\n",
+				    rc);
+
+		goto err_create_wq;
+	}
+
+	INIT_WORK(&ne_pci_dev->notify_work, ne_event_work_handler);
+
 	rc = pci_alloc_irq_vectors(pdev, nr_vecs, nr_vecs, PCI_IRQ_MSIX);
 	if (rc < 0) {
 		dev_err_ratelimited(&pdev->dev,
@@ -335,11 +427,30 @@ static int ne_setup_msix(struct pci_dev *pdev, struct ne_pci_dev *ne_pci_dev)
 		goto err_req_irq_reply;
 	}
 
+	/*
+	 * This IRQ gets triggered every time any enclave's state changes. Its
+	 * handler then scans for the changes and propagates them to the user
+	 * space.
+	 */
+	rc = request_irq(pci_irq_vector(pdev, NE_VEC_EVENT),
+			 ne_event_handler, 0, "enclave_evt", ne_pci_dev);
+	if (rc < 0) {
+		dev_err_ratelimited(&pdev->dev,
+				    "Failure in allocating irq event [rc=%d]\n",
+				    rc);
+
+		goto err_req_irq_event;
+	}
+
 	return 0;
 
+err_req_irq_event:
+	free_irq(pci_irq_vector(pdev, NE_VEC_REPLY), ne_pci_dev);
 err_req_irq_reply:
 	pci_free_irq_vectors(pdev);
 err_alloc_irq_vecs:
+	destroy_workqueue(ne_pci_dev->event_wq);
+err_create_wq:
 	return rc;
 }
 
@@ -494,8 +605,10 @@ static int ne_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_ne_pci_dev_enable:
 err_ne_pci_dev_disable:
+	free_irq(pci_irq_vector(pdev, NE_VEC_EVENT), ne_pci_dev);
 	free_irq(pci_irq_vector(pdev, NE_VEC_REPLY), ne_pci_dev);
 	pci_free_irq_vectors(pdev);
+	destroy_workqueue(ne_pci_dev->event_wq);
 err_setup_msix:
 	pci_iounmap(pdev, ne_pci_dev->iomem_base);
 err_iomap:
@@ -518,8 +631,15 @@ static void ne_remove(struct pci_dev *pdev)
 
 	pci_set_drvdata(pdev, NULL);
 
+	free_irq(pci_irq_vector(pdev, NE_VEC_EVENT), ne_pci_dev);
 	free_irq(pci_irq_vector(pdev, NE_VEC_REPLY), ne_pci_dev);
 	pci_free_irq_vectors(pdev);
+
+	if (ne_pci_dev->event_wq) {
+		flush_work(&ne_pci_dev->notify_work);
+		flush_workqueue(ne_pci_dev->event_wq);
+		destroy_workqueue(ne_pci_dev->event_wq);
+	}
 
 	pci_iounmap(pdev, ne_pci_dev->iomem_base);
 

@@ -233,6 +233,228 @@ err_get_unused_fd:
 	return rc;
 }
 
+/**
+ * ne_sanity_check_user_mem_region - Sanity check the userspace memory
+ * region received during the set user memory region ioctl call.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ * @mem_region: user space memory region to be sanity checked.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_sanity_check_user_mem_region(struct ne_enclave *ne_enclave,
+	struct kvm_userspace_memory_region *mem_region)
+{
+	BUG_ON(!ne_enclave);
+
+	if (WARN_ON(!mem_region))
+		return -EINVAL;
+
+	if (mem_region->slot > ne_enclave->max_mem_regions) {
+		pr_err_ratelimited("Mem slot higher than max mem regions\n");
+
+		return -EINVAL;
+	}
+
+	if ((mem_region->memory_size % MIN_MEM_REGION_SIZE) != 0) {
+		pr_err_ratelimited("Mem region size not multiple of 2 MiB\n");
+
+		return -EINVAL;
+	}
+
+	if ((mem_region->userspace_addr & (MIN_MEM_REGION_SIZE - 1)) ||
+	    !access_ok((void __user *)(unsigned long)mem_region->userspace_addr,
+		       mem_region->memory_size)) {
+		pr_err_ratelimited("Invalid user space addr range\n");
+
+		return -EINVAL;
+	}
+
+	if ((mem_region->guest_phys_addr + mem_region->memory_size) <
+	    mem_region->guest_phys_addr) {
+		pr_err_ratelimited("Invalid guest phys addr range\n");
+
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * ne_set_user_memory_region_ioctl - Add user space memory region to the slot
+ * associated with the current enclave.
+ *
+ * This function gets called with the ne_enclave mutex held.
+ *
+ * @ne_enclave: private data associated with the current enclave.
+ * @mem_region: user space memory region to be associated with the given slot.
+ *
+ * @returns: 0 on success, negative return value on failure.
+ */
+static int ne_set_user_memory_region_ioctl(struct ne_enclave *ne_enclave,
+	struct kvm_userspace_memory_region *mem_region)
+{
+	struct ne_pci_dev_cmd_reply cmd_reply = {};
+	long gup_rc = 0;
+	unsigned long i = 0;
+	struct ne_mem_region *ne_mem_region = NULL;
+	unsigned long nr_phys_contig_mem_regions = 0;
+	unsigned long nr_pinned_pages = 0;
+	struct page **phys_contig_mem_regions = NULL;
+	int rc = -EINVAL;
+	struct slot_add_mem_req slot_add_mem_req = {};
+
+	BUG_ON(!ne_enclave);
+	BUG_ON(!ne_enclave->pdev);
+
+	if (WARN_ON(!mem_region))
+		return -EINVAL;
+
+	if (ne_enclave->mm != current->mm)
+		return -EIO;
+
+	rc = ne_sanity_check_user_mem_region(ne_enclave, mem_region);
+	if (rc < 0)
+		return rc;
+
+	ne_mem_region = kzalloc(sizeof(*ne_mem_region), GFP_KERNEL);
+	if (!ne_mem_region)
+		return -ENOMEM;
+
+	/*
+	 * TODO: Update nr_pages value to handle contiguous virtual address
+	 * ranges mapped to non-contiguous physical regions. Hugetlbfs can give
+	 * 2 MiB / 1 GiB contiguous physical regions.
+	 */
+	ne_mem_region->nr_pages = mem_region->memory_size / MIN_MEM_REGION_SIZE;
+
+	ne_mem_region->pages = kcalloc(ne_mem_region->nr_pages,
+				       sizeof(*ne_mem_region->pages),
+				       GFP_KERNEL);
+	if (!ne_mem_region->pages) {
+		kzfree(ne_mem_region);
+
+		return -ENOMEM;
+	}
+
+	phys_contig_mem_regions = kcalloc(ne_mem_region->nr_pages,
+					  sizeof(*phys_contig_mem_regions),
+					  GFP_KERNEL);
+	if (!phys_contig_mem_regions) {
+		kzfree(ne_mem_region->pages);
+		kzfree(ne_mem_region);
+
+		return -ENOMEM;
+	}
+
+	/*
+	 * TODO: Handle non-contiguous memory regions received from user space.
+	 * Hugetlbfs can give 2 MiB / 1 GiB contiguous physical regions. The
+	 * virtual address space can be seen as contiguous, although it is
+	 * mapped underneath to 2 MiB / 1 GiB physical regions e.g. 8 MiB
+	 * virtual address space mapped to 4 physically contiguous regions of 2
+	 * MiB.
+	 */
+	do {
+		unsigned long tmp_nr_pages = ne_mem_region->nr_pages -
+			nr_pinned_pages;
+		struct page **tmp_pages = ne_mem_region->pages +
+			nr_pinned_pages;
+		u64 tmp_userspace_addr = mem_region->userspace_addr +
+			nr_pinned_pages * MIN_MEM_REGION_SIZE;
+
+		gup_rc = get_user_pages(tmp_userspace_addr, tmp_nr_pages,
+					FOLL_GET, tmp_pages, NULL);
+		if (gup_rc < 0) {
+			rc = gup_rc;
+
+			pr_err_ratelimited("Failure in gup [rc=%d]\n", rc);
+
+			unpin_user_pages(ne_mem_region->pages, nr_pinned_pages);
+
+			goto err_get_user_pages;
+		}
+
+		nr_pinned_pages += gup_rc;
+
+	} while (nr_pinned_pages < ne_mem_region->nr_pages);
+
+	/*
+	 * TODO: Update checks once physically contiguous regions are collected
+	 * based on the user space address and get_user_pages() results.
+	 */
+	for (i = 0; i < ne_mem_region->nr_pages; i++) {
+		if (!PageHuge(ne_mem_region->pages[i])) {
+			pr_err_ratelimited("The page isn't a hugetlbfs page\n");
+
+			goto err_phys_pages_check;
+		}
+
+		if (huge_page_size(page_hstate(ne_mem_region->pages[i])) !=
+		    MIN_MEM_REGION_SIZE) {
+			pr_err_ratelimited("The page size isn't 2 MiB\n");
+
+			goto err_phys_pages_check;
+		}
+
+		/*
+		 * TODO: Update once handled non-contiguous memory regions
+		 * received from user space.
+		 */
+		phys_contig_mem_regions[i] = ne_mem_region->pages[i];
+	}
+
+	/*
+	 * TODO: Update once handled non-contiguous memory regions received
+	 * from user space.
+	 */
+	nr_phys_contig_mem_regions = ne_mem_region->nr_pages;
+
+	for (i = 0; i < nr_phys_contig_mem_regions; i++) {
+		u64 phys_addr = page_to_phys(phys_contig_mem_regions[i]);
+
+		slot_add_mem_req.slot_uid = ne_enclave->slot_uid;
+		slot_add_mem_req.paddr = phys_addr;
+		/*
+		 * TODO: Update memory size of physical contiguous memory
+		 * region, in case of non-contiguous memory regions received
+		 * from user space.
+		 */
+		slot_add_mem_req.size = MIN_MEM_REGION_SIZE;
+
+		rc = ne_do_request(ne_enclave->pdev, SLOT_ADD_MEM,
+				   &slot_add_mem_req, sizeof(slot_add_mem_req),
+				   &cmd_reply, sizeof(cmd_reply));
+		if (rc < 0) {
+			pr_err_ratelimited("Failure in slot add mem [rc=%d]\n",
+					   rc);
+
+			goto err_slot_add_mem;
+		}
+
+		memset(&slot_add_mem_req, 0, sizeof(slot_add_mem_req));
+		memset(&cmd_reply, 0, sizeof(cmd_reply));
+	}
+
+	list_add(&ne_mem_region->mem_region_list_entry,
+		 &ne_enclave->mem_regions_list);
+
+	kzfree(phys_contig_mem_regions);
+
+	return 0;
+
+err_slot_add_mem:
+err_phys_pages_check:
+	unpin_user_pages(ne_mem_region->pages, ne_mem_region->nr_pages);
+err_get_user_pages:
+	kzfree(phys_contig_mem_regions);
+	kzfree(ne_mem_region->pages);
+	kzfree(ne_mem_region);
+	return rc;
+}
+
 static int ne_enclave_open(struct inode *node, struct file *file)
 {
 	return 0;
@@ -273,6 +495,26 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 		/* Put back the CPU in enclave cpu pool, if add vcpu error. */
 		if (rc < 0)
 			cpumask_set_cpu(vcpu_id, ne_enclave->cpu_siblings);
+
+		mutex_unlock(&ne_enclave->enclave_info_mutex);
+
+		return rc;
+	}
+
+	case KVM_SET_USER_MEMORY_REGION: {
+		struct kvm_userspace_memory_region mem_region = {};
+		int rc = -EINVAL;
+
+		if (copy_from_user(&mem_region, (void *)arg,
+				   sizeof(mem_region))) {
+			pr_err_ratelimited("Failure in copy from user\n");
+
+			return -EFAULT;
+		}
+
+		mutex_lock(&ne_enclave->enclave_info_mutex);
+
+		rc = ne_set_user_memory_region_ioctl(ne_enclave, &mem_region);
 
 		mutex_unlock(&ne_enclave->enclave_info_mutex);
 

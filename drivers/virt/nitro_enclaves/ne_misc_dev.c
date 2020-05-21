@@ -243,6 +243,30 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 		return rc;
 	}
 
+	case NE_GET_IMAGE_LOAD_METADATA: {
+		struct image_load_metadata image_load_metadata = {};
+
+		if (copy_from_user(&image_load_metadata, (void *)arg,
+				   sizeof(image_load_metadata))) {
+			pr_err_ratelimited(NE "Error in copy from user\n");
+
+			return -EFAULT;
+		}
+
+		/* TODO: Check flags before setting the memory offset. */
+
+		image_load_metadata.memory_offset = NE_IMAGE_LOAD_OFFSET;
+
+		if (copy_to_user((void *)arg, &image_load_metadata,
+				 sizeof(image_load_metadata))) {
+			pr_err_ratelimited(NE "Error in copy to user\n");
+
+			return -EFAULT;
+		}
+
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}

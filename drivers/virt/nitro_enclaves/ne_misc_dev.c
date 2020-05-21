@@ -536,6 +536,31 @@ static long ne_enclave_ioctl(struct file *file, unsigned int cmd,
 		return rc;
 	}
 
+	case NE_GET_IMAGE_LOAD_INFO: {
+		struct ne_image_load_info image_load_info = {};
+
+		if (copy_from_user(&image_load_info, (void *)arg,
+				   sizeof(image_load_info))) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Error in copy from user\n");
+
+			return -EFAULT;
+		}
+
+		if (image_load_info.flags == NE_EIF_IMAGE)
+			image_load_info.memory_offset = NE_EIF_LOAD_OFFSET;
+
+		if (copy_to_user((void *)arg, &image_load_info,
+				 sizeof(image_load_info))) {
+			dev_err_ratelimited(ne_misc_dev.this_device,
+					    "Error in copy to user\n");
+
+			return -EFAULT;
+		}
+
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}

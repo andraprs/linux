@@ -145,7 +145,7 @@
 
 struct sockaddr_vm {
 	__kernel_sa_family_t svm_family;
-	unsigned short svm_reserved1;
+	unsigned short svm_flags;
 	unsigned int svm_port;
 	unsigned int svm_cid;
 	unsigned char svm_zero[sizeof(struct sockaddr) -

@@ -114,6 +114,22 @@
 
 #define VMADDR_CID_HOST 2
 
+/* This sockaddr_vm flag value covers the current default use case:
+ * local vsock communication between guest and host and nested VMs setup.
+ * In addition to this, implicitly, the vsock packets are forwarded to the host
+ * if no host->guest vsock transport is set.
+ */
+#define VMADDR_FLAG_DEFAULT_COMMUNICATION	0x0000
+
+/* Set this flag value in the sockaddr_vm corresponding field if the vsock
+ * channel needs to be setup between two sibling VMs running on the same host.
+ * This way can explicitly distinguish between vsock channels created for nested
+ * VMs (or local communication between guest and host) and the ones created for
+ * sibling VMs. And vsock channels for multiple use cases (nested / sibling VMs)
+ * can be setup at the same time.
+ */
+#define VMADDR_FLAG_SIBLING_VMS_COMMUNICATION	0x0001
+
 /* Invalid vSockets version. */
 
 #define VM_SOCKETS_INVALID_VERSION -1U
@@ -145,7 +161,7 @@
 
 struct sockaddr_vm {
 	__kernel_sa_family_t svm_family;
-	unsigned short svm_reserved1;
+	unsigned short svm_flag;
 	unsigned int svm_port;
 	unsigned int svm_cid;
 	unsigned char svm_zero[sizeof(struct sockaddr) -
